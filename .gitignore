@@ -1,0 +1,6 @@
+input/
+output/
+music/
+__pycache__/
+*.part.mp4
+*.filter.txt
