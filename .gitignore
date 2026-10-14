@@ -8,3 +8,4 @@ stickers/
 __pycache__/
 *.part.mp4
 *.filter.txt
+dist/
