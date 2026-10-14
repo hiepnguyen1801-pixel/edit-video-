@@ -12,12 +12,13 @@ Pipeline per video:
   7. Dynamic zoom oscillating between 102% and 105%.
   8. Color grade: contrast +3%, brightness -2%.
   9. Film grain overlay (~2-3% opacity).
- 10. Animated progress bar (top or bottom).
- 11. Background music from a folder, looped, at 3-5% volume.
- 12. Encode H.264 / AAC, 30 fps, 5-8 Mbps, MP4 (+faststart).
+ 10. Frame Drop/Duplicate (Ngẫu nhiên xô lệch khung hình).
+ 11. Animated progress bar (top or bottom).
+ 12. Background music from a folder, looped, at 3-5% volume.
  13. Blur the original subtitle/logo areas and burn in new word-by-word subtitles.
  14. Short flash / glitch / B-roll (0.5 s) inserts at random points.
- 15. Voice EQ (cut low bass + high treble) and a light reverb (< 5%).
+ 15. Ghost Overlay (Cấy bóng ma thị giác 1% chạy quanh màn hình).
+ 16. Voice EQ (cut low bass + high treble) and a light reverb (< 5%).
 
 Usage:
   python3 tiktok_batch.py -i input/ -o output/ -m music/
@@ -121,7 +122,6 @@ def probe(path: Path) -> dict:
 
 
 def detect_silences(path: Path, start: float, length: float, db: float, min_dur: float) -> list[Segment]:
-    """Return silent intervals (source timeline) inside [start, start+length]."""
     res = subprocess.run(
         ["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{start:.3f}", "-t", f"{length:.3f}",
          "-i", str(path), "-vn", "-af", f"silencedetect=n={db}dB:d={min_dur}", "-f", "null", "-"],
@@ -137,13 +137,12 @@ def detect_silences(path: Path, start: float, length: float, db: float, min_dur:
         if m and cur is not None:
             silences.append((start + cur, start + float(m.group(1))))
             cur = None
-    if cur is not None:  # silence runs to the end
+    if cur is not None:  
         silences.append((start + cur, start + length))
     return silences
 
 
 def audio_energy(path: Path, start: float, length: float, win: float = 0.1):
-    """RMS energy per `win` seconds on the source timeline (numpy array) or None."""
     try:
         import numpy as np
     except ImportError:
@@ -169,11 +168,10 @@ def audio_energy(path: Path, start: float, length: float, win: float = 0.1):
 # --------------------------------------------------------------------------- #
 
 def keep_segments(start: float, end: float, silences: list[Segment], pad: float) -> list[Segment]:
-    """Complement of silences inside [start, end], with a little padding kept around speech."""
     segs: list[Segment] = []
     cur = start
     for s, e in sorted(silences):
-        s2, e2 = s + pad, e - pad  # keep `pad` seconds of silence on each side
+        s2, e2 = s + pad, e - pad
         if e2 - s2 <= 0.05:
             continue
         if s2 > cur:
@@ -185,7 +183,6 @@ def keep_segments(start: float, end: float, silences: list[Segment], pad: float)
 
 
 def slice_timeline(segs: list[Segment], t0: float, t1: float) -> list[Segment]:
-    """Map interval [t0, t1] of the concatenated timeline back to source segments."""
     out, acc = [], 0.0
     for a, b in segs:
         d = b - a
@@ -197,15 +194,13 @@ def slice_timeline(segs: list[Segment], t0: float, t1: float) -> list[Segment]:
 
 
 def pick_hook(segs: list[Segment], energy, e_start: float, hook_len: float, win: float = 0.1) -> float:
-    """Return start time (on concatenated timeline) of the most energetic `hook_len` window."""
     total = sum(b - a for a, b in segs)
     if total <= hook_len * 2:
         return 0.0
     if energy is None:
-        return total * 0.35  # no audio analysis possible -> a point in the first half
+        return total * 0.35
 
     import numpy as np
-    # Build the energy curve on the concatenated timeline.
     parts = []
     for a, b in segs:
         i0 = int((a - e_start) / win)
@@ -216,7 +211,6 @@ def pick_hook(segs: list[Segment], energy, e_start: float, hook_len: float, win:
     if len(curve) <= k:
         return 0.0
     sums = np.convolve(curve, np.ones(k), mode="valid")
-    # Skip the very beginning: it is already at the front.
     skip = min(len(sums) - 1, k)
     best = skip + int(np.argmax(sums[skip:]))
     return best * win
@@ -250,20 +244,19 @@ def build_timeline(path: Path, info: dict, cfg: Settings, rng: random.Random) ->
     hook = slice_timeline(segs, h0, h1)
     if cfg.hook_mode == "copy":
         body = segs
-    else:  # move
+    else:
         body = slice_timeline(segs, 0, h0) + slice_timeline(segs, h1, total)
     return hook + body
 
 
 # --------------------------------------------------------------------------- #
-# Subtitles: transcribe -> map onto the edited timeline -> ASS (word by word)
+# Subtitles
 # --------------------------------------------------------------------------- #
 
-Word = tuple[float, float, str]  # (start, end, text)
+Word = tuple[float, float, str]
 
 _whisper_lock = threading.Lock()
 _whisper_models: dict[str, object] = {}
-
 
 def transcribe_whisper(path: Path, model_name: str, lang: str | None) -> list[Word]:
     try:
@@ -274,14 +267,11 @@ def transcribe_whisper(path: Path, model_name: str, lang: str | None) -> list[Wo
         if model_name not in _whisper_models:
             _whisper_models[model_name] = WhisperModel(model_name, device="auto", compute_type="int8")
         model = _whisper_models[model_name]
-        segments, _ = model.transcribe(str(path), language=lang, word_timestamps=True,
-                                       vad_filter=True)
+        segments, _ = model.transcribe(str(path), language=lang, word_timestamps=True, vad_filter=True)
         return [(w.start, w.end, w.word.strip())
                 for seg in segments for w in (seg.words or []) if w.word.strip()]
 
-
 def parse_srt(path: Path) -> list[Word]:
-    """Read an .srt and split each cue evenly into words."""
     def ts(x: str) -> float:
         h, m, rest = x.strip().replace(",", ".").split(":")
         return int(h) * 3600 + int(m) * 60 + float(rest)
@@ -302,9 +292,7 @@ def parse_srt(path: Path) -> list[Word]:
         words += [(t0 + i * step, t0 + (i + 1) * step, w) for i, w in enumerate(toks)]
     return words
 
-
 def map_words(words: list[Word], segs: list[Segment]) -> list[Word]:
-    """Move word timings from the source timeline onto the edited (cut + sped up) timeline."""
     out: list[Word] = []
     cum = 0.0
     for a, b in segs:
@@ -314,17 +302,14 @@ def map_words(words: list[Word], segs: list[Segment]) -> list[Word]:
         cum += b - a
     return sorted(out)
 
-
 def ass_time(t: float) -> str:
     cs = max(0, round(t * 100))
     return f"{cs // 360000}:{cs // 6000 % 60:02d}:{cs // 100 % 60:02d}.{cs % 100:02d}"
-
 
 def write_ass(words: list[Word], dst: Path, cfg: Settings, max_words: int = 3) -> None:
     def esc(x: str) -> str:
         return x.replace("\\", "").replace("{", "(").replace("}", ")")
 
-    # Group words into short chunks (max 3 words, break on pauses).
     chunks: list[list[Word]] = []
     for w in words:
         if chunks and len(chunks[-1]) < max_words and w[0] - chunks[-1][-1][1] < 0.35:
@@ -333,7 +318,7 @@ def write_ass(words: list[Word], dst: Path, cfg: Settings, max_words: int = 3) -
             chunks.append([w])
 
     margin_lr = (OUT_W - SAFE_W) // 2 + 20
-    margin_v = (OUT_H - SAFE_H) // 2 + 170        # keeps text well inside the safe box
+    margin_v = (OUT_H - SAFE_H) // 2 + 170
     lines = [
         "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {OUT_W}", f"PlayResY: {OUT_H}",
         "WrapStyle: 0", "ScaledBorderAndShadow: yes", "",
@@ -352,16 +337,14 @@ def write_ass(words: list[Word], dst: Path, cfg: Settings, max_words: int = 3) -
             end = chunk[i + 1][0] if i + 1 < len(chunk) else e + 0.15
             parts = []
             for j, t in enumerate(texts):
-                if j == i:  # active word: yellow + pop
-                    parts.append(r"{\c&H00E5FF&\fscx118\fscy118\t(0,90,\fscx108\fscy108)}"
-                                 + t + r"{\r}")
+                if j == i:
+                    parts.append(r"{\c&H00E5FF&\fscx118\fscy118\t(0,90,\fscx108\fscy108)}" + t + r"{\r}")
                 else:
                     parts.append(t)
             pop = r"{\fscx80\fscy80\t(0,80,\fscx100\fscy100)}" if i == 0 else ""
             lines.append(f"Dialogue: 0,{ass_time(s)},{ass_time(max(end, s + 0.05))},Sub,,0,0,0,,"
                          + pop + " ".join(parts))
     dst.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
 
 def get_subtitles(src: Path, segs: list[Segment], dst_ass: Path, cfg: Settings) -> bool:
     if cfg.subs == "off":
@@ -371,7 +354,7 @@ def get_subtitles(src: Path, segs: list[Segment], dst_ass: Path, cfg: Settings) 
         words = parse_srt(srt)
     elif cfg.subs == "auto":
         words = transcribe_whisper(src, cfg.whisper_model, cfg.sub_lang)
-    else:  # "srt" mode and no sidecar file
+    else: 
         return False
     words = map_words(words, segs)
     if not words:
@@ -379,12 +362,9 @@ def get_subtitles(src: Path, segs: list[Segment], dst_ass: Path, cfg: Settings) 
     write_ass(words, dst_ass, cfg)
     return True
 
-
 def filter_path(p: Path) -> str:
-    """Escape a file path for use inside an ffmpeg filter argument."""
     s = str(p.resolve()).replace("\\", "/")
     return "'" + s.replace("'", r"'\''").replace(":", r"\:") + "'"
-
 
 # --------------------------------------------------------------------------- #
 # Transition FX: flash / glitch / B-roll
@@ -392,7 +372,6 @@ def filter_path(p: Path) -> str:
 
 def plan_fx(segs: list[Segment], out_dur: float, cfg: Settings, rng: random.Random,
             n_broll: int) -> list[tuple[str, float]]:
-    """Pick (kind, time) events on the output timeline; prefer real cut points."""
     if cfg.fx_every[1] <= 0:
         return []
     cuts, cum = [], 0.0
@@ -400,7 +379,7 @@ def plan_fx(segs: list[Segment], out_dur: float, cfg: Settings, rng: random.Rand
         cum += b - a
         cuts.append(cum / SPEED)
     kinds = ["flash", "glitch"] + (["broll"] if n_broll else [])
-    events, t = [], cfg.hook_len / SPEED   # nothing inside the hook except its end
+    events, t = [], cfg.hook_len / SPEED
     while True:
         t += rng.uniform(*cfg.fx_every)
         last = events[-1][1] if events else 0.0
@@ -412,15 +391,11 @@ def plan_fx(segs: list[Segment], out_dur: float, cfg: Settings, rng: random.Rand
         events.append((rng.choice(kinds), t))
     return events
 
-
 def flash_expr(times: list[float], width: float = 0.12, amount: float = 0.45) -> str:
-    """Brightness boost peaking at each time, as an eq expression term."""
     return "+".join(f"{amount}*max(0,1-abs(t-{t:.3f})/{width})" for t in times)
-
 
 def between(times: list[float], length: float) -> str:
     return "+".join(f"between(t,{t:.3f},{t + length:.3f})" for t in times)
-
 
 # --------------------------------------------------------------------------- #
 # Filter graph
@@ -435,13 +410,10 @@ def merge_adjacent(segs: list[Segment]) -> list[Segment]:
             out.append((a, b))
     return out
 
-
 def layout_filter(mode: str) -> str:
-    """[v] -> [lay] 1080x1920."""
-    if mode == "fill":  # crop to cover the whole 9:16 frame
+    if mode == "fill":  
         return (f"[v]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,"
                 f"crop={OUT_W}:{OUT_H},setsar=1[lay]")
-    # blur / safe: content fitted on a blurred background
     box_w, box_h = (SAFE_W, SAFE_H) if mode == "safe" else (OUT_W, OUT_H)
     return (f"[v]split=2[bg0][fg0];"
             f"[bg0]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,crop={OUT_W}:{OUT_H},"
@@ -450,9 +422,7 @@ def layout_filter(mode: str) -> str:
             f"scale=trunc(iw/2)*2:trunc(ih/2)*2[fg];"
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[lay]")
 
-
 def blur_regions(boxes: list[tuple[float, float, float, float]]) -> list[str]:
-    """[vs] -> [v] with each (x, y, w, h) box (fractions of the frame) heavily blurred."""
     if not boxes:
         return ["[vs]null[v]"]
     f = [f"[vs]split={len(boxes) + 1}[base]" + "".join(f"[r{i}]" for i in range(len(boxes)))]
@@ -465,14 +435,12 @@ def blur_regions(boxes: list[tuple[float, float, float, float]]) -> list[str]:
     f.append(f"[{cur}]null[v]")
     return f
 
-
 def build_filter(segs: list[Segment], has_audio: bool, out_dur: float, cfg: Settings,
                  rng: random.Random, bgm_input: int | None, broll_inputs: list[int],
                  ass_file: Path | None) -> str:
     f: list[str] = []
     n = len(segs)
 
-    # 1) Cut + reorder segments
     for i, (a, b) in enumerate(segs):
         f.append(f"[0:v]trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS[v{i}]")
         if has_audio:
@@ -482,32 +450,27 @@ def build_filter(segs: list[Segment], has_audio: bool, out_dur: float, cfg: Sett
             f.append(f"anullsrc=r={SAMPLE_RATE}:cl=stereo,atrim=duration={b - a:.3f}[a{i}]")
     f.append("".join(f"[v{i}][a{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[vc][ac]")
 
-    # 2) Speed 1.04x. Audio: asetrate resamples -> pitch rises (no pitch preservation).
     f.append(f"[vc]setpts=PTS/{SPEED}[vs]")
     voice = [f"asetrate={SAMPLE_RATE * SPEED:.0f}", f"aresample={SAMPLE_RATE}"]
     if cfg.eq_low > 0:
-        voice.append(f"highpass=f={cfg.eq_low:.0f}")       # trim the low bass
+        voice.append(f"highpass=f={cfg.eq_low:.0f}")
     if cfg.eq_high > 0:
-        voice.append(f"lowpass=f={cfg.eq_high:.0f}")       # trim the top treble
-    if cfg.reverb > 0:                                      # light room reverb
+        voice.append(f"lowpass=f={cfg.eq_high:.0f}")
+    if cfg.reverb > 0:
         r = cfg.reverb
         voice.append(f"aecho=in_gain=1:out_gain=1:delays=43|67|89:"
                      f"decays={r:.3f}|{r * 0.7:.3f}|{r * 0.45:.3f}")
     f.append("[ac]" + ",".join(voice) + "[voice]")
 
-    # 2b) Blur original subtitle / logo regions (source coordinates)
     f += blur_regions(cfg.blur_boxes)
-
-    # 3) Layout into 9:16 / safe box
     f.append(layout_filter(cfg.layout))
 
-    # 4) Flip, dynamic zoom, color, grain
     chain = []
     if cfg.flip:
         chain.append("hflip")
     zmid = (cfg.zoom_min + cfg.zoom_max) / 2
     zamp = (cfg.zoom_max - cfg.zoom_min) / 2
-    period = rng.uniform(6, 10)          # seconds per zoom in/out cycle
+    period = rng.uniform(6, 10)
     phase = rng.uniform(0, 2 * math.pi)
     z = f"({zmid:.4f}+{zamp:.4f}*sin(2*PI*t/{period:.2f}+{phase:.3f}))"
     chain.append(f"scale=w='trunc({OUT_W}*{z}/2)*2':h='trunc({OUT_H}*{z}/2)*2':eval=frame")
@@ -523,12 +486,16 @@ def build_filter(segs: list[Segment], has_audio: bool, out_dur: float, cfg: Sett
         chain.append(f"rgbashift=rh=-14:bh=14:gv=6:enable='{on}'")
         chain.append(f"noise=alls=45:allf=t:enable='{on}'")
     if cfg.grain > 0:
-        # noise strength is in 0..255 units: 2.5% opacity ~= +/-6
         chain.append(f"noise=alls={round(cfg.grain * 255)}:allf=t+u")
+
+
+    drop_cycle = int(rng.uniform(120, 180))
+    chain.append(f"select='not(eq(mod(n\\,{drop_cycle})\\,0))'")
+    # --------------------------------------------------------
+
     chain.append(f"fps={FPS},format=yuv420p")
     f.append("[lay]" + ",".join(chain) + "[g0]")
 
-    # 4b) B-roll / meme inserts (full frame, cfg.broll_len seconds each)
     cur = "g0"
     for i, t in enumerate(brolls):
         src = broll_inputs[i % len(broll_inputs)]
@@ -540,21 +507,36 @@ def build_filter(segs: list[Segment], has_audio: bool, out_dur: float, cfg: Sett
                  f"enable='between(t,{t:.3f},{t + cfg.broll_len:.3f})'[gb{i}]")
         cur = f"gb{i}"
 
-    # 4c) New dynamic subtitles (on top of B-roll so text stays readable)
     if ass_file is not None:
         f.append(f"[{cur}]ass={filter_path(ass_file)}[graded]")
     else:
         f.append(f"[{cur}]null[graded]")
+
+    # --- [THÊM KỸ THUẬT: BÓNG MA THỊ GIÁC (Ghost Overlay)] ---
+    # Tự động tạo một lớp hình vuông trắng có Opacity = 1% ngay trên RAM, 
+    # không cần load thêm file ảnh bên ngoài. Dùng hàm Toán học bắt nó chạy vòng vòng.
+    gx = rng.uniform(0.5, 2.5)
+    gy = rng.uniform(0.5, 2.5)
+    
+    # Tạo source bóng ma
+    f.append(f"color=c=white@0.01:s=100x100:r={FPS}[ghost]")
+    # Tính toán quỹ đạo
+    expr_x = f"({OUT_W}-w)/2+({OUT_W}-w)/2*sin(t*{gx:.3f})"
+    expr_y = f"({OUT_H}-h)/2+({OUT_H}-h)/2*cos(t*{gy:.3f})"
+    # Ghép lên video chính
+    f.append(f"[graded][ghost]overlay=x='{expr_x}':y='{expr_y}':shortest=1[with_ghost]")
+    # ---------------------------------------------------------
 
     # 5) Progress bar
     bh = cfg.bar_height
     y = 0 if cfg.bar_pos == "top" else OUT_H - bh
     f.append(f"color=c=black@0.35:s={OUT_W}x{bh}:r={FPS}[track]")
     f.append(f"color=c={cfg.bar_color}:s={OUT_W}x{bh}:r={FPS}[bar]")
-    f.append(f"[graded][track]overlay=0:{y}:shortest=1[t1]")
+    
+    # Ở đây thay vì lấy [graded] để ghép, ta lấy [with_ghost] là output của bước trên
+    f.append(f"[with_ghost][track]overlay=0:{y}:shortest=1[t1]")
     f.append(f"[t1][bar]overlay=x='-w+w*t/{out_dur:.3f}':y={y}:shortest=1[vout]")
 
-    # 6) Background music
     if bgm_input is not None:
         vol = rng.uniform(*cfg.bgm_volume)
         f.append(f"[{bgm_input}:a]aformat=sample_rates={SAMPLE_RATE}:channel_layouts=stereo,"
@@ -595,7 +577,7 @@ def process_one(src: Path, dst: Path, cfg: Settings, seed: int) -> str:
         pool = sorted(p for p in cfg.broll_dir.iterdir()
                       if p.suffix.lower() in VIDEO_EXTS | IMAGE_EXTS)
         rng.shuffle(pool)
-        n_fx = len(plan_fx(segs, out_dur, cfg, random.Random(seed), 1))  # upper bound
+        n_fx = len(plan_fx(segs, out_dur, cfg, random.Random(seed), 1))  
         for clip in pool[:max(0, min(len(pool), n_fx))]:
             idx = cmd.count("-i")
             if clip.suffix.lower() in IMAGE_EXTS:
@@ -746,7 +728,7 @@ def main() -> int:
             try:
                 print("OK   " + fut.result(), flush=True)
                 ok += 1
-            except Exception as e:  # keep going with the rest of the batch
+            except Exception as e:
                 print(f"FAIL {src.name}: {e}", file=sys.stderr, flush=True)
                 fail += 1
     print(f"Done: {ok} ok, {fail} failed.")
@@ -755,4 +737,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-  
