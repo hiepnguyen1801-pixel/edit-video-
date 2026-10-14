@@ -102,7 +102,7 @@ python3 tiktok_batch.py -i input -o output -m music -b broll \
 
 Phụ đề:
 - Nếu bên cạnh video có file `.srt` trùng tên (ví dụ `abc.mp4` + `abc.srt`), script dùng file đó và tự khớp thời gian sau khi cắt/tăng tốc.
-- `--subs auto` không có `.srt` thì dùng Whisper (`pip install faster-whisper`, lần đầu tự tải model, `--whisper-model small`). Thêm `--lang vi` cho tiếng Việt.
+- `--subs auto` không có `.srt` thì dùng Whisper: cài thêm `pip install -r requirements-whisper.txt` (cần Python 64-bit bản 3.9-3.12; lần đầu tự tải model, `--whisper-model small`). Thêm `--lang vi` cho tiếng Việt. Nếu cài lỗi `ctranslate2` thì dùng file `.srt` thay thế.
 - Font phải hỗ trợ tiếng Việt (Arial, Roboto, Be Vietnam Pro...).
 
 Thư mục `broll/` chứa ảnh (jpg/png) hoặc clip ngắn, mỗi lần chèn dài 0.5 giây.

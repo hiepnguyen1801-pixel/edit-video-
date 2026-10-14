@@ -334,7 +334,8 @@ def transcribe_whisper(path: Path, model_name: str, lang: str | None) -> list[Wo
     try:
         from faster_whisper import WhisperModel
     except ImportError:
-        raise RuntimeError("--subs auto needs: pip install faster-whisper")
+        raise RuntimeError("--subs auto needs: pip install -r requirements-whisper.txt "
+                           "(64-bit Python 3.9-3.12), or put a .srt next to the video")
     with _whisper_lock:
         if model_name not in _whisper_models:
             _whisper_models[model_name] = WhisperModel(model_name, device="auto", compute_type="int8")
