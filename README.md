@@ -1,32 +1,61 @@
 # Edit video hàng loạt cho TikTok
 
-Script `tiktok_batch.py` dùng **ffmpeg** để xử lý cả thư mục video, xong video này thì tự chạy video tiếp theo. Nếu một video bị lỗi, script ghi log và chạy tiếp các video còn lại.
+Script `tiktok_batch.py` dùng **ffmpeg** để xử lý cả thư mục video, xong video này thì tự chạy video tiếp theo. Nếu một video bị lỗi, script ghi log và chạy tiếp các video còn lại. Video nào đã có trong `output/` sẽ được bỏ qua, nên khi bị dừng giữa chừng chỉ cần chạy lại.
 
-## Cài đặt
+## 1. Cài đặt (một lần)
+
+| Hệ điều hành | Cài ffmpeg | Cài Python |
+|---|---|---|
+| Windows | tải bản "release essentials" ở https://www.gyan.dev/ffmpeg/builds/, giải nén, thêm thư mục `bin` vào PATH | https://www.python.org (tick "Add to PATH") |
+| macOS | `brew install ffmpeg` | `brew install python` |
+| Ubuntu | `sudo apt install ffmpeg python3-pip` | có sẵn |
 
 ```bash
-# Ubuntu/Debian
-sudo apt install ffmpeg python3-pip
-# macOS: brew install ffmpeg
-# Windows: tải ffmpeg rồi thêm vào PATH
 pip install -r requirements.txt
 ```
 
-## Chạy
+Kiểm tra: `ffmpeg -version` và `python --version` đều chạy được.
+
+## 2. Chạy nhanh
 
 ```
-input/   <- video gốc (mp4, mov, mkv, ...)
-music/   <- nhạc nền (mp3, m4a, wav ...), bạn tự tải
-output/  <- kết quả *_tiktok.mp4
+edit-video-/
+├── input/     <- bỏ video gốc vào đây (mp4, mov, mkv...)
+│              (tùy chọn) abc.srt = phụ đề, abc.txt = tiêu đề cho video abc.mp4
+├── music/     <- nhạc nền (mp3, m4a, wav...)          (không bắt buộc)
+├── broll/     <- ảnh/clip B-roll, meme                (không bắt buộc)
+├── stickers/  <- sticker động gif/png/webm            (không bắt buộc)
+└── output/    <- kết quả *_tiktok.mp4
 ```
+
+- **Windows:** nhấp đúp `run.bat`
+- **macOS/Linux:** `./run.sh`
+
+Lần đầu chạy sẽ tự tạo các thư mục trên. Thêm tham số vào sau lệnh nếu cần, ví dụ:
 
 ```bash
-python3 tiktok_batch.py -i input -o output -m music
-# Chạy song song 2 video, có lật ngang:
-python3 tiktok_batch.py -i input -o output -m music -j 2 --flip
+./run.sh --flip --blur-box 0,0.78,1,0.17 --subs auto --lang vi
+run.bat --preset veryfast
 ```
 
-Video nào đã có trong `output/` sẽ được bỏ qua, nên khi bị dừng giữa chừng chỉ cần chạy lại lệnh. Muốn render lại thì thêm `--overwrite`.
+Hoặc gọi trực tiếp:
+
+```bash
+python3 tiktok_batch.py -i input -o output -m music -b broll -s stickers -j 2
+```
+
+Xem toàn bộ tham số: `python3 tiktok_batch.py -h`
+
+## 3. Quy trình mỗi video
+
+1. Cắt 1-2s đầu và cuối, bỏ khoảng lặng.
+2. Lấy đoạn 3s sôi động nhất làm hook đưa lên đầu.
+3. Phần thân: cứ 3s bỏ 1s, điểm cắt dời vào chỗ im lặng.
+4. Tăng tốc 1.04x cả hình và tiếng (giọng cao hơn khoảng 0.7 semitone), EQ + reverb nhẹ.
+5. Dựng khung 1080x1920, làm mờ vùng chữ/logo gốc (nếu khai báo), zoom động, chỉnh màu, hạt nhiễu.
+6. Bốc ngẫu nhiên 4 hiệu ứng + 2 bộ lọc màu phủ lên trên video gốc.
+7. Chớp sáng / B-roll ngắn, phụ đề động, thanh tiến trình, nhạc nền 3-5%.
+8. Xuất MP4 H.264, 30 fps, 6-8 Mbps.
 
 ## Yêu cầu và cách xử lý
 
@@ -54,7 +83,7 @@ Ghi chú:
 - `--hook-mode move` cắt đoạn hook khỏi vị trí cũ. `copy` thì vừa đặt hook lên đầu vừa giữ đoạn đó ở chỗ cũ.
 - Video không có tiếng sẽ không cắt khoảng lặng và lấy hook ở khoảng 35% thời lượng.
 - Muốn chạy nhanh hơn dùng `--preset veryfast` (file lớn hơn một chút).
-- Thời gian xử lý tham khảo: khoảng 1.5-3 lần độ dài video với preset `medium`, tùy CPU.
+- Thời gian xử lý tham khảo: video 20s mất khoảng 1 phút khi chạy 2 video song song trên máy 4 nhân (preset `medium`), tùy CPU.
 
 ## Phần mở rộng
 

@@ -19,6 +19,10 @@ Pipeline per video:
  14. Short flash / glitch / B-roll (0.5 s) inserts at random points.
  15. Ghost Overlay (Cấy bóng ma thị giác 1% chạy quanh màn hình).
  16. Voice EQ (cut low bass + high treble) and a light reverb (< 5%).
+ 17. Jump cuts: drop 1 s after every 3 s of body content, snapped to quiet spots (+/-0.5 s).
+ 18. 4 random effects (typewriter, Ken Burns, visualizer, spring pop-up, highlight,
+     glitch, light leaks, stickers) layered over the original video.
+ 19. 2 random color filters (CSS filter recipes converted to ffmpeg).
 
 Usage:
   python3 tiktok_batch.py -i input/ -o output/ -m music/
@@ -863,10 +867,12 @@ def main() -> int:
           [x for x in cfg.filters if x not in efx.FILTERS]
     if bad:
         p.error(f"unknown effect/filter: {', '.join(bad)}")
-    if cfg.music_dir and not cfg.music_dir.is_dir():
-        p.error(f"music folder not found: {cfg.music_dir}")
-    if cfg.broll_dir and not cfg.broll_dir.is_dir():
-        p.error(f"B-roll folder not found: {cfg.broll_dir}")
+    # Optional asset folders: missing or empty ones are simply skipped.
+    for attr, label in (("music_dir", "music"), ("broll_dir", "B-roll"), ("stickers_dir", "stickers")):
+        d = getattr(cfg, attr)
+        if d and not d.is_dir():
+            print(f"warning: {label} folder not found ({d}), skipping it", file=sys.stderr)
+            setattr(cfg, attr, None)
 
     if a.input.is_file():
         sources = [a.input]
