@@ -1,6 +1,8 @@
 input/
 output/
 music/
+broll/
+*.subs.ass
 __pycache__/
 *.part.mp4
 *.filter.txt

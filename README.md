@@ -55,4 +55,26 @@ Ghi chú:
 - Muốn chạy nhanh hơn dùng `--preset veryfast` (file lớn hơn một chút).
 - Thời gian xử lý tham khảo: khoảng 1.5-3 lần độ dài video với preset `medium`, tùy CPU.
 
+## Phần mở rộng
+
+```bash
+python3 tiktok_batch.py -i input -o output -m music -b broll \
+    --blur-box 0,0.78,1,0.17 --subs auto --lang vi
+```
+
+| Tính năng | Cách làm | Tham số |
+|---|---|---|
+| Làm mờ phụ đề/logo gốc | boxblur mạnh lên từng vùng, tọa độ theo tỉ lệ khung gốc `X,Y,W,H` (0..1). Lặp lại tham số được nhiều vùng | `--blur-box 0,0.78,1,0.17` (dải phụ đề dưới) `--blur-box 0.8,0,0.2,0.1` (logo góc phải trên) |
+| Phụ đề động | hiện từng cụm 3 từ, từ đang đọc sáng vàng và phóng to, nằm trong safe box | `--subs auto\|srt\|off`, `--font`, `--font-size`, `--no-upper` |
+| Chớp sáng / Glitch / B-roll 0.5s | cứ 4-8 giây chèn 1 hiệu ứng ngẫu nhiên, ưu tiên đặt đúng điểm cắt | `--fx-every 4-8` (0 = tắt), `-b broll/`, `--broll-len 0.5` |
+| EQ cắt bass/treble | high-pass 90 Hz, low-pass 13 kHz | `--eq-low 90 --eq-high 13000` (0 = tắt) |
+| Reverb < 5% | aecho 3 tầng, mức tối đa 0.05 | `--reverb 0.04` |
+
+Phụ đề:
+- Nếu bên cạnh video có file `.srt` trùng tên (ví dụ `abc.mp4` + `abc.srt`), script dùng file đó và tự khớp thời gian sau khi cắt/tăng tốc.
+- `--subs auto` không có `.srt` thì dùng Whisper (`pip install faster-whisper`, lần đầu tự tải model, `--whisper-model small`). Thêm `--lang vi` cho tiếng Việt.
+- Font phải hỗ trợ tiếng Việt (Arial, Roboto, Be Vietnam Pro...).
+
+Thư mục `broll/` chứa ảnh (jpg/png) hoặc clip ngắn, mỗi lần chèn dài 0.5 giây.
+
 Chỉ dùng cho video và nhạc mà bạn có quyền sử dụng.

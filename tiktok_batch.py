@@ -15,10 +15,15 @@ Pipeline per video:
  10. Animated progress bar (top or bottom).
  11. Background music from a folder, looped, at 3-5% volume.
  12. Encode H.264 / AAC, 30 fps, 5-8 Mbps, MP4 (+faststart).
+ 13. Blur the original subtitle/logo areas and burn in new word-by-word subtitles.
+ 14. Short flash / glitch / B-roll (0.5 s) inserts at random points.
+ 15. Voice EQ (cut low bass + high treble) and a light reverb (< 5%).
 
 Usage:
   python3 tiktok_batch.py -i input/ -o output/ -m music/
   python3 tiktok_batch.py -i input/ -o output/ -m music/ --flip --jobs 2
+  python3 tiktok_batch.py -i input/ -o output/ -m music/ -b broll/ \
+      --blur-box 0,0.78,1,0.17 --subs auto
 """
 
 from __future__ import annotations
@@ -31,12 +36,14 @@ import random
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".flv"}
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".flac", ".opus"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 OUT_W, OUT_H = 1080, 1920
 SAFE_W, SAFE_H = 880, 1420
@@ -73,6 +80,19 @@ class Settings:
     preset: str
     overwrite: bool
     keep_temp: bool
+    blur_boxes: list[tuple[float, float, float, float]]
+    subs: str
+    whisper_model: str
+    sub_lang: str | None
+    font: str
+    font_size: int
+    sub_upper: bool
+    broll_dir: Path | None
+    fx_every: tuple[float, float]
+    broll_len: float
+    eq_low: float
+    eq_high: float
+    reverb: float
 
 
 # --------------------------------------------------------------------------- #
@@ -236,6 +256,173 @@ def build_timeline(path: Path, info: dict, cfg: Settings, rng: random.Random) ->
 
 
 # --------------------------------------------------------------------------- #
+# Subtitles: transcribe -> map onto the edited timeline -> ASS (word by word)
+# --------------------------------------------------------------------------- #
+
+Word = tuple[float, float, str]  # (start, end, text)
+
+_whisper_lock = threading.Lock()
+_whisper_models: dict[str, object] = {}
+
+
+def transcribe_whisper(path: Path, model_name: str, lang: str | None) -> list[Word]:
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        raise RuntimeError("--subs auto needs: pip install faster-whisper")
+    with _whisper_lock:
+        if model_name not in _whisper_models:
+            _whisper_models[model_name] = WhisperModel(model_name, device="auto", compute_type="int8")
+        model = _whisper_models[model_name]
+        segments, _ = model.transcribe(str(path), language=lang, word_timestamps=True,
+                                       vad_filter=True)
+        return [(w.start, w.end, w.word.strip())
+                for seg in segments for w in (seg.words or []) if w.word.strip()]
+
+
+def parse_srt(path: Path) -> list[Word]:
+    """Read an .srt and split each cue evenly into words."""
+    def ts(x: str) -> float:
+        h, m, rest = x.strip().replace(",", ".").split(":")
+        return int(h) * 3600 + int(m) * 60 + float(rest)
+
+    words: list[Word] = []
+    blocks = re.split(r"\n\s*\n", path.read_text(encoding="utf-8-sig").strip())
+    for block in blocks:
+        lines = block.strip().splitlines()
+        idx = next((i for i, l in enumerate(lines) if "-->" in l), None)
+        if idx is None:
+            continue
+        a, b = lines[idx].split("-->")
+        t0, t1 = ts(a), ts(b.split()[0])
+        toks = re.sub(r"<[^>]+>", "", " ".join(lines[idx + 1:])).split()
+        if not toks:
+            continue
+        step = (t1 - t0) / len(toks)
+        words += [(t0 + i * step, t0 + (i + 1) * step, w) for i, w in enumerate(toks)]
+    return words
+
+
+def map_words(words: list[Word], segs: list[Segment]) -> list[Word]:
+    """Move word timings from the source timeline onto the edited (cut + sped up) timeline."""
+    out: list[Word] = []
+    cum = 0.0
+    for a, b in segs:
+        for s, e, w in words:
+            if a <= s < b:
+                out.append(((cum + s - a) / SPEED, (cum + min(e, b) - a) / SPEED, w))
+        cum += b - a
+    return sorted(out)
+
+
+def ass_time(t: float) -> str:
+    cs = max(0, round(t * 100))
+    return f"{cs // 360000}:{cs // 6000 % 60:02d}:{cs // 100 % 60:02d}.{cs % 100:02d}"
+
+
+def write_ass(words: list[Word], dst: Path, cfg: Settings, max_words: int = 3) -> None:
+    def esc(x: str) -> str:
+        return x.replace("\\", "").replace("{", "(").replace("}", ")")
+
+    # Group words into short chunks (max 3 words, break on pauses).
+    chunks: list[list[Word]] = []
+    for w in words:
+        if chunks and len(chunks[-1]) < max_words and w[0] - chunks[-1][-1][1] < 0.35:
+            chunks[-1].append(w)
+        else:
+            chunks.append([w])
+
+    margin_lr = (OUT_W - SAFE_W) // 2 + 20
+    margin_v = (OUT_H - SAFE_H) // 2 + 170        # keeps text well inside the safe box
+    lines = [
+        "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {OUT_W}", f"PlayResY: {OUT_H}",
+        "WrapStyle: 0", "ScaledBorderAndShadow: yes", "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
+        "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Sub,{cfg.font},{cfg.font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,"
+        f"-1,0,0,0,100,100,0,0,1,6,2,2,{margin_lr},{margin_lr},{margin_v},1",
+        "", "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    for chunk in chunks:
+        texts = [esc(w[2].upper() if cfg.sub_upper else w[2]) for w in chunk]
+        for i, (s, e, _) in enumerate(chunk):
+            end = chunk[i + 1][0] if i + 1 < len(chunk) else e + 0.15
+            parts = []
+            for j, t in enumerate(texts):
+                if j == i:  # active word: yellow + pop
+                    parts.append(r"{\c&H00E5FF&\fscx118\fscy118\t(0,90,\fscx108\fscy108)}"
+                                 + t + r"{\r}")
+                else:
+                    parts.append(t)
+            pop = r"{\fscx80\fscy80\t(0,80,\fscx100\fscy100)}" if i == 0 else ""
+            lines.append(f"Dialogue: 0,{ass_time(s)},{ass_time(max(end, s + 0.05))},Sub,,0,0,0,,"
+                         + pop + " ".join(parts))
+    dst.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def get_subtitles(src: Path, segs: list[Segment], dst_ass: Path, cfg: Settings) -> bool:
+    if cfg.subs == "off":
+        return False
+    srt = src.with_suffix(".srt")
+    if srt.exists():
+        words = parse_srt(srt)
+    elif cfg.subs == "auto":
+        words = transcribe_whisper(src, cfg.whisper_model, cfg.sub_lang)
+    else:  # "srt" mode and no sidecar file
+        return False
+    words = map_words(words, segs)
+    if not words:
+        return False
+    write_ass(words, dst_ass, cfg)
+    return True
+
+
+def filter_path(p: Path) -> str:
+    """Escape a file path for use inside an ffmpeg filter argument."""
+    s = str(p.resolve()).replace("\\", "/")
+    return "'" + s.replace("'", r"'\''").replace(":", r"\:") + "'"
+
+
+# --------------------------------------------------------------------------- #
+# Transition FX: flash / glitch / B-roll
+# --------------------------------------------------------------------------- #
+
+def plan_fx(segs: list[Segment], out_dur: float, cfg: Settings, rng: random.Random,
+            n_broll: int) -> list[tuple[str, float]]:
+    """Pick (kind, time) events on the output timeline; prefer real cut points."""
+    if cfg.fx_every[1] <= 0:
+        return []
+    cuts, cum = [], 0.0
+    for a, b in segs[:-1]:
+        cum += b - a
+        cuts.append(cum / SPEED)
+    kinds = ["flash", "glitch"] + (["broll"] if n_broll else [])
+    events, t = [], cfg.hook_len / SPEED   # nothing inside the hook except its end
+    while True:
+        t += rng.uniform(*cfg.fx_every)
+        last = events[-1][1] if events else 0.0
+        near = [c for c in cuts if abs(c - t) < 1.5 and c > last + 1.0]
+        if near:
+            t = near[0]
+        if t > out_dur - 1.5:
+            break
+        events.append((rng.choice(kinds), t))
+    return events
+
+
+def flash_expr(times: list[float], width: float = 0.12, amount: float = 0.45) -> str:
+    """Brightness boost peaking at each time, as an eq expression term."""
+    return "+".join(f"{amount}*max(0,1-abs(t-{t:.3f})/{width})" for t in times)
+
+
+def between(times: list[float], length: float) -> str:
+    return "+".join(f"between(t,{t:.3f},{t + length:.3f})" for t in times)
+
+
+# --------------------------------------------------------------------------- #
 # Filter graph
 # --------------------------------------------------------------------------- #
 
@@ -264,8 +451,24 @@ def layout_filter(mode: str) -> str:
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[lay]")
 
 
+def blur_regions(boxes: list[tuple[float, float, float, float]]) -> list[str]:
+    """[vs] -> [v] with each (x, y, w, h) box (fractions of the frame) heavily blurred."""
+    if not boxes:
+        return ["[vs]null[v]"]
+    f = [f"[vs]split={len(boxes) + 1}[base]" + "".join(f"[r{i}]" for i in range(len(boxes)))]
+    cur = "base"
+    for i, (x, y, w, h) in enumerate(boxes):
+        f.append(f"[r{i}]crop=w='max(8,trunc(iw*{w}/2)*2)':h='max(8,trunc(ih*{h}/2)*2)'"
+                 f":x='iw*{x}':y='ih*{y}',boxblur=luma_radius='min(w,h)/4':luma_power=3[rb{i}]")
+        f.append(f"[{cur}][rb{i}]overlay=x='main_w*{x}':y='main_h*{y}'[bl{i}]")
+        cur = f"bl{i}"
+    f.append(f"[{cur}]null[v]")
+    return f
+
+
 def build_filter(segs: list[Segment], has_audio: bool, out_dur: float, cfg: Settings,
-                 rng: random.Random, bgm_input: int | None) -> str:
+                 rng: random.Random, bgm_input: int | None, broll_inputs: list[int],
+                 ass_file: Path | None) -> str:
     f: list[str] = []
     n = len(segs)
 
@@ -280,8 +483,20 @@ def build_filter(segs: list[Segment], has_audio: bool, out_dur: float, cfg: Sett
     f.append("".join(f"[v{i}][a{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[vc][ac]")
 
     # 2) Speed 1.04x. Audio: asetrate resamples -> pitch rises (no pitch preservation).
-    f.append(f"[vc]setpts=PTS/{SPEED}[v]")
-    f.append(f"[ac]asetrate={SAMPLE_RATE * SPEED:.0f},aresample={SAMPLE_RATE}[voice]")
+    f.append(f"[vc]setpts=PTS/{SPEED}[vs]")
+    voice = [f"asetrate={SAMPLE_RATE * SPEED:.0f}", f"aresample={SAMPLE_RATE}"]
+    if cfg.eq_low > 0:
+        voice.append(f"highpass=f={cfg.eq_low:.0f}")       # trim the low bass
+    if cfg.eq_high > 0:
+        voice.append(f"lowpass=f={cfg.eq_high:.0f}")       # trim the top treble
+    if cfg.reverb > 0:                                      # light room reverb
+        r = cfg.reverb
+        voice.append(f"aecho=in_gain=1:out_gain=1:delays=43|67|89:"
+                     f"decays={r:.3f}|{r * 0.7:.3f}|{r * 0.45:.3f}")
+    f.append("[ac]" + ",".join(voice) + "[voice]")
+
+    # 2b) Blur original subtitle / logo regions (source coordinates)
+    f += blur_regions(cfg.blur_boxes)
 
     # 3) Layout into 9:16 / safe box
     f.append(layout_filter(cfg.layout))
@@ -297,12 +512,39 @@ def build_filter(segs: list[Segment], has_audio: bool, out_dur: float, cfg: Sett
     z = f"({zmid:.4f}+{zamp:.4f}*sin(2*PI*t/{period:.2f}+{phase:.3f}))"
     chain.append(f"scale=w='trunc({OUT_W}*{z}/2)*2':h='trunc({OUT_H}*{z}/2)*2':eval=frame")
     chain.append(f"crop={OUT_W}:{OUT_H}")
-    chain.append(f"eq=contrast={1 + cfg.contrast:.3f}:brightness={cfg.brightness:.3f}")
+    fx = plan_fx(segs, out_dur, cfg, rng, len(broll_inputs))
+    flashes = [t for k, t in fx if k == "flash"]
+    glitches = [t for k, t in fx if k == "glitch"]
+    brolls = [t for k, t in fx if k == "broll"]
+    bright = f"{cfg.brightness:.3f}" + (f"+{flash_expr(flashes)}" if flashes else "")
+    chain.append(f"eq=contrast={1 + cfg.contrast:.3f}:brightness='{bright}':eval=frame")
+    if glitches:
+        on = between(glitches, 0.2)
+        chain.append(f"rgbashift=rh=-14:bh=14:gv=6:enable='{on}'")
+        chain.append(f"noise=alls=45:allf=t:enable='{on}'")
     if cfg.grain > 0:
         # noise strength is in 0..255 units: 2.5% opacity ~= +/-6
         chain.append(f"noise=alls={round(cfg.grain * 255)}:allf=t+u")
     chain.append(f"fps={FPS},format=yuv420p")
-    f.append("[lay]" + ",".join(chain) + "[graded]")
+    f.append("[lay]" + ",".join(chain) + "[g0]")
+
+    # 4b) B-roll / meme inserts (full frame, cfg.broll_len seconds each)
+    cur = "g0"
+    for i, t in enumerate(brolls):
+        src = broll_inputs[i % len(broll_inputs)]
+        f.append(f"[{src}:v]trim=duration={cfg.broll_len:.2f},"
+                 f"scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,"
+                 f"crop={OUT_W}:{OUT_H},setsar=1,fps={FPS},format=yuv420p,"
+                 f"setpts=PTS-STARTPTS+{t:.3f}/TB[br{i}]")
+        f.append(f"[{cur}][br{i}]overlay=0:0:eof_action=pass:"
+                 f"enable='between(t,{t:.3f},{t + cfg.broll_len:.3f})'[gb{i}]")
+        cur = f"gb{i}"
+
+    # 4c) New dynamic subtitles (on top of B-roll so text stays readable)
+    if ass_file is not None:
+        f.append(f"[{cur}]ass={filter_path(ass_file)}[graded]")
+    else:
+        f.append(f"[{cur}]null[graded]")
 
     # 5) Progress bar
     bh = cfg.bar_height
@@ -348,7 +590,26 @@ def process_one(src: Path, dst: Path, cfg: Settings, seed: int) -> str:
         cmd += ["-stream_loop", "-1", "-i", str(track)]
         bgm_input = 1
 
-    graph = build_filter(segs, info["has_audio"], out_dur, cfg, rng, bgm_input)
+    broll_inputs: list[int] = []
+    if cfg.broll_dir:
+        pool = sorted(p for p in cfg.broll_dir.iterdir()
+                      if p.suffix.lower() in VIDEO_EXTS | IMAGE_EXTS)
+        rng.shuffle(pool)
+        n_fx = len(plan_fx(segs, out_dur, cfg, random.Random(seed), 1))  # upper bound
+        for clip in pool[:max(0, min(len(pool), n_fx))]:
+            idx = cmd.count("-i")
+            if clip.suffix.lower() in IMAGE_EXTS:
+                cmd += ["-loop", "1", "-framerate", str(FPS), "-t", f"{cfg.broll_len:.2f}",
+                        "-i", str(clip)]
+            else:
+                cmd += ["-t", f"{cfg.broll_len:.2f}", "-i", str(clip)]
+            broll_inputs.append(idx)
+
+    ass_file = dst.with_suffix(".subs.ass")
+    has_subs = get_subtitles(src, segs, ass_file, cfg)
+
+    graph = build_filter(segs, info["has_audio"], out_dur, cfg, rng, bgm_input, broll_inputs,
+                         ass_file if has_subs else None)
     graph_file = dst.with_suffix(".filter.txt")
     graph_file.write_text(graph)
 
@@ -369,6 +630,7 @@ def process_one(src: Path, dst: Path, cfg: Settings, seed: int) -> str:
     finally:
         if not cfg.keep_temp:
             graph_file.unlink(missing_ok=True)
+            ass_file.unlink(missing_ok=True)
         tmp.unlink(missing_ok=True)
 
     return (f"{src.name}: {info['duration']:.1f}s -> {out_dur:.1f}s "
@@ -378,6 +640,11 @@ def process_one(src: Path, dst: Path, cfg: Settings, seed: int) -> str:
 def parse_range(s: str) -> tuple[float, float]:
     parts = [float(x) for x in s.split("-")] if "-" in s.strip("-") else [float(s)] * 2
     return (min(parts), max(parts))
+
+
+def parse_box(s: str) -> tuple[float, float, float, float]:
+    x, y, w, h = (float(v) for v in s.split(","))
+    return (x, y, w, h)
 
 
 def main() -> int:
@@ -411,6 +678,23 @@ def main() -> int:
     p.add_argument("--seed", type=int, help="random seed for reproducible results")
     p.add_argument("--overwrite", action="store_true", help="re-render existing outputs")
     p.add_argument("--keep-temp", action="store_true", help="keep generated filter graphs")
+    p.add_argument("--blur-box", action="append", default=[], metavar="X,Y,W,H",
+                   help="blur a region of the source (fractions 0..1), repeatable; "
+                        "e.g. 0,0.78,1,0.17 = bottom subtitle band")
+    p.add_argument("--subs", choices=["auto", "srt", "off"], default="off",
+                   help="auto: video.srt if present, else Whisper; srt: only video.srt")
+    p.add_argument("--whisper-model", default="small", help="faster-whisper model name")
+    p.add_argument("--lang", default=None, help="speech language for Whisper, e.g. vi, en")
+    p.add_argument("--font", default="Arial", help="subtitle font (must support your language)")
+    p.add_argument("--font-size", type=int, default=80)
+    p.add_argument("--no-upper", action="store_true", help="keep subtitle case as-is")
+    p.add_argument("-b", "--broll", type=Path, help="folder of B-roll/meme images or clips")
+    p.add_argument("--fx-every", default="4-8",
+                   help="seconds between flash/glitch/B-roll inserts (0 = off)")
+    p.add_argument("--broll-len", type=float, default=0.5, help="B-roll insert length (s)")
+    p.add_argument("--eq-low", type=float, default=90, help="high-pass Hz (cut bass, 0 = off)")
+    p.add_argument("--eq-high", type=float, default=13000, help="low-pass Hz (cut treble, 0 = off)")
+    p.add_argument("--reverb", type=float, default=0.04, help="reverb amount 0..0.05 (0 = off)")
     a = p.parse_args()
 
     cfg = Settings(
@@ -422,9 +706,16 @@ def main() -> int:
         bar_pos=a.bar, bar_color=a.bar_color, bar_height=a.bar_height,
         bgm_volume=parse_range(a.bgm_volume), bitrate=a.bitrate, maxrate=a.maxrate,
         preset=a.preset, overwrite=a.overwrite, keep_temp=a.keep_temp,
+        blur_boxes=[parse_box(b) for b in a.blur_box], subs=a.subs,
+        whisper_model=a.whisper_model, sub_lang=a.lang, font=a.font, font_size=a.font_size,
+        sub_upper=not a.no_upper, broll_dir=a.broll, fx_every=parse_range(a.fx_every),
+        broll_len=a.broll_len, eq_low=a.eq_low, eq_high=a.eq_high,
+        reverb=min(max(a.reverb, 0.0), 0.05),
     )
     if cfg.music_dir and not cfg.music_dir.is_dir():
         p.error(f"music folder not found: {cfg.music_dir}")
+    if cfg.broll_dir and not cfg.broll_dir.is_dir():
+        p.error(f"B-roll folder not found: {cfg.broll_dir}")
 
     if a.input.is_file():
         sources = [a.input]
