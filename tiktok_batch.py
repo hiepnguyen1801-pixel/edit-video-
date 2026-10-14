@@ -67,6 +67,8 @@ class Settings:
     silence_pad: float
     hook_len: float
     hook_mode: str
+    chop_keep: float
+    chop_drop: float
     layout: str
     flip: bool
     zoom_min: float
@@ -243,19 +245,34 @@ def build_timeline(path: Path, info: dict, cfg: Settings, rng: random.Random) ->
         segs, energy = [(start, end)], None
 
     if cfg.hook_len <= 0:
-        return segs
+        return chop(segs, cfg.chop_keep, cfg.chop_drop)
 
     total = sum(b - a for a, b in segs)
     h0 = pick_hook(segs, energy, start, cfg.hook_len)
     h1 = min(total, h0 + cfg.hook_len)
     if h0 <= 0.01:
-        return segs
+        # hook is already at the start: keep it whole, chop what follows
+        return slice_timeline(segs, 0, h1) + chop(slice_timeline(segs, h1, total),
+                                                  cfg.chop_keep, cfg.chop_drop)
     hook = slice_timeline(segs, h0, h1)
     if cfg.hook_mode == "copy":
         body = segs
     else:
         body = slice_timeline(segs, 0, h0) + slice_timeline(segs, h1, total)
-    return hook + body
+    return hook + chop(body, cfg.chop_keep, cfg.chop_drop)
+
+
+def chop(segs: list[Segment], keep: float, drop: float) -> list[Segment]:
+    """Every `keep` seconds of content, cut out the next `drop` seconds."""
+    if keep <= 0 or drop <= 0:
+        return segs
+    total = sum(b - a for a, b in segs)
+    out: list[Segment] = []
+    t = 0.0
+    while t < total:
+        out += slice_timeline(segs, t, min(total, t + keep))
+        t += keep + drop
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -707,6 +724,11 @@ def parse_range(s: str) -> tuple[float, float]:
     return (min(parts), max(parts))
 
 
+def parse_chop(s: str) -> tuple[float, float]:
+    parts = [float(v) for v in s.split(",")]
+    return (parts[0], parts[1]) if len(parts) == 2 else (0.0, 0.0)
+
+
 def parse_box(s: str) -> tuple[float, float, float, float]:
     x, y, w, h = (float(v) for v in s.split(","))
     return (x, y, w, h)
@@ -724,6 +746,8 @@ def main() -> int:
     p.add_argument("--silence-min", type=float, default=0.6, help="min silence length to cut (s)")
     p.add_argument("--silence-pad", type=float, default=0.12, help="silence kept around speech (s)")
     p.add_argument("--hook", type=float, default=3.0, help="hook length in seconds (0 = off)")
+    p.add_argument("--chop", default="3,1", metavar="KEEP,DROP",
+                   help="every KEEP seconds cut DROP seconds (default 3,1; 0 = off)")
     p.add_argument("--hook-mode", choices=["move", "copy"], default="move",
                    help="move: cut hook out of its place; copy: also keep it in place")
     p.add_argument("--layout", choices=["blur", "safe", "fill"], default="blur",
@@ -774,7 +798,8 @@ def main() -> int:
     cfg = Settings(
         music_dir=a.music, trim_head=parse_range(a.trim_head), trim_tail=parse_range(a.trim_tail),
         silence_db=a.silence_db, silence_min=a.silence_min, silence_pad=a.silence_pad,
-        hook_len=a.hook, hook_mode=a.hook_mode, layout=a.layout, flip=a.flip,
+        hook_len=a.hook, hook_mode=a.hook_mode,
+        chop_keep=parse_chop(a.chop)[0], chop_drop=parse_chop(a.chop)[1], layout=a.layout, flip=a.flip,
         zoom_min=parse_range(a.zoom)[0], zoom_max=parse_range(a.zoom)[1],
         contrast=a.contrast, brightness=a.brightness, grain=a.grain,
         bar_pos=a.bar, bar_color=a.bar_color, bar_height=a.bar_height,

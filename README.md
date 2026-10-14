@@ -47,6 +47,7 @@ Video nào đã có trong `output/` sẽ được bỏ qua, nên khi bị dừng
 | Cắt 1-2s đầu/cuối | độ dài cắt ngẫu nhiên trong khoảng | `--trim-head 1-2 --trim-tail 1-2` |
 | Hook 3s lên đầu | lấy đoạn 3s có năng lượng âm thanh mạnh nhất đưa lên đầu | `--hook 3 --hook-mode move\|copy` |
 | Auto-cut khoảng lặng | `silencedetect`, ngưỡng -35dB, đoạn lặng ≥ 0.6s | `--silence-db --silence-min --silence-pad` |
+| Cứ 3s cắt bỏ 1s | sau khi bỏ khoảng lặng, phần thân video cứ giữ 3s thì bỏ 1s. Đoạn hook 3s ở đầu được giữ nguyên | `--chop 3,1` (`--chop 0` = tắt) |
 
 Ghi chú:
 - `--layout blur` (mặc định): video ngang nằm giữa, nền là chính video đó làm mờ. `--layout safe`: toàn bộ nội dung nằm trong safe box 880x1420. `--layout fill`: crop cho kín khung.
