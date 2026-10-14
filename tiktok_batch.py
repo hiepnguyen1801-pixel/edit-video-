@@ -39,6 +39,8 @@ import subprocess
 import sys
 import threading
 import time
+
+import effects as efx
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -94,6 +96,13 @@ class Settings:
     eq_low: float
     eq_high: float
     reverb: float
+    n_effects: int
+    n_filters: int
+    effects: list[str]
+    filters: list[str]
+    stickers_dir: Path | None
+    title: str | None
+    cta: str
 
 
 # --------------------------------------------------------------------------- #
@@ -371,15 +380,17 @@ def filter_path(p: Path) -> str:
 # --------------------------------------------------------------------------- #
 
 def plan_fx(segs: list[Segment], out_dur: float, cfg: Settings, rng: random.Random,
-            n_broll: int) -> list[tuple[str, float]]:
+            n_broll: int, glitch: bool = True) -> list[tuple[str, float]]:
     if cfg.fx_every[1] <= 0:
         return []
     cuts, cum = [], 0.0
     for a, b in segs[:-1]:
         cum += b - a
         cuts.append(cum / SPEED)
-    kinds = ["flash", "glitch"] + (["broll"] if n_broll else [])
+    kinds = ["flash"] + (["glitch"] if glitch else []) + (["broll"] if n_broll else [])
     events, t = [], cfg.hook_len / SPEED
+    if glitch and cfg.hook_len > 0 and t < out_dur - 1.5:
+        events.append(("glitch", max(0.0, t - 0.1)))   # hit the hook -> body transition
     while True:
         t += rng.uniform(*cfg.fx_every)
         last = events[-1][1] if events else 0.0
@@ -437,7 +448,7 @@ def blur_regions(boxes: list[tuple[float, float, float, float]]) -> list[str]:
 
 def build_filter(segs: list[Segment], has_audio: bool, out_dur: float, cfg: Settings,
                  rng: random.Random, bgm_input: int | None, broll_inputs: list[int],
-                 ass_file: Path | None) -> str:
+                 ass_file: Path | None, plan: dict) -> str:
     f: list[str] = []
     n = len(segs)
 
@@ -460,7 +471,13 @@ def build_filter(segs: list[Segment], has_audio: bool, out_dur: float, cfg: Sett
         r = cfg.reverb
         voice.append(f"aecho=in_gain=1:out_gain=1:delays=43|67|89:"
                      f"decays={r:.3f}|{r * 0.7:.3f}|{r * 0.45:.3f}")
-    f.append("[ac]" + ",".join(voice) + "[voice]")
+    fx_on = plan["effects"]
+    if "visualizer" in fx_on:
+        f.append("[ac]" + ",".join(voice) + "[voice0]")
+        viz, _ = efx.visualizer("voice0", "voice", rng)
+        f += viz
+    else:
+        f.append("[ac]" + ",".join(voice) + "[voice]")
 
     f += blur_regions(cfg.blur_boxes)
     f.append(layout_filter(cfg.layout))
@@ -468,14 +485,17 @@ def build_filter(segs: list[Segment], has_audio: bool, out_dur: float, cfg: Sett
     chain = []
     if cfg.flip:
         chain.append("hflip")
-    zmid = (cfg.zoom_min + cfg.zoom_max) / 2
-    zamp = (cfg.zoom_max - cfg.zoom_min) / 2
-    period = rng.uniform(6, 10)
-    phase = rng.uniform(0, 2 * math.pi)
-    z = f"({zmid:.4f}+{zamp:.4f}*sin(2*PI*t/{period:.2f}+{phase:.3f}))"
-    chain.append(f"scale=w='trunc({OUT_W}*{z}/2)*2':h='trunc({OUT_H}*{z}/2)*2':eval=frame")
-    chain.append(f"crop={OUT_W}:{OUT_H}")
-    fx = plan_fx(segs, out_dur, cfg, rng, len(broll_inputs))
+    if "kenburns" in fx_on:
+        chain += efx.ken_burns(rng, out_dur)
+    else:
+        zmid = (cfg.zoom_min + cfg.zoom_max) / 2
+        zamp = (cfg.zoom_max - cfg.zoom_min) / 2
+        period = rng.uniform(6, 10)
+        phase = rng.uniform(0, 2 * math.pi)
+        z = f"({zmid:.4f}+{zamp:.4f}*sin(2*PI*t/{period:.2f}+{phase:.3f}))"
+        chain.append(f"scale=w='trunc({OUT_W}*{z}/2)*2':h='trunc({OUT_H}*{z}/2)*2':eval=frame")
+        chain.append(f"crop={OUT_W}:{OUT_H}")
+    fx = plan_fx(segs, out_dur, cfg, rng, len(broll_inputs), "glitch" in fx_on)
     flashes = [t for k, t in fx if k == "flash"]
     glitches = [t for k, t in fx if k == "glitch"]
     brolls = [t for k, t in fx if k == "broll"]
@@ -485,6 +505,8 @@ def build_filter(segs: list[Segment], has_audio: bool, out_dur: float, cfg: Sett
         on = between(glitches, 0.2)
         chain.append(f"rgbashift=rh=-14:bh=14:gv=6:enable='{on}'")
         chain.append(f"noise=alls=45:allf=t:enable='{on}'")
+    if plan["filters"]:
+        chain.append(efx.color_filters(plan["filters"]))
     if cfg.grain > 0:
         chain.append(f"noise=alls={round(cfg.grain * 255)}:allf=t+u")
 
@@ -507,10 +529,21 @@ def build_filter(segs: list[Segment], has_audio: bool, out_dur: float, cfg: Sett
                  f"enable='between(t,{t:.3f},{t + cfg.broll_len:.3f})'[gb{i}]")
         cur = f"gb{i}"
 
+    if "lightleak" in fx_on:
+        n = max(1, min(4, int(out_dur // 8)))
+        times = sorted(rng.uniform(1.0, max(1.5, out_dur - 2.0)) for _ in range(n))
+        f += efx.light_leaks(cur, "leaked", times, FPS, rng)
+        cur = "leaked"
+    if plan["stickers"]:
+        f += efx.sticker_overlays(cur, "stickered", plan["stickers"], rng)
+        cur = "stickered"
     if ass_file is not None:
-        f.append(f"[{cur}]ass={filter_path(ass_file)}[graded]")
-    else:
-        f.append(f"[{cur}]null[graded]")
+        f.append(f"[{cur}]ass={filter_path(ass_file)}[subbed]")
+        cur = "subbed"
+    if plan["text_ass"] is not None:
+        f.append(f"[{cur}]ass={filter_path(plan['text_ass'])}[texted]")
+        cur = "texted"
+    f.append(f"[{cur}]null[graded]")
 
     # --- [THÊM KỸ THUẬT: BÓNG MA THỊ GIÁC (Ghost Overlay)] ---
     # Tự động tạo một lớp hình vuông trắng có Opacity = 1% ngay trên RAM, 
@@ -534,7 +567,11 @@ def build_filter(segs: list[Segment], has_audio: bool, out_dur: float, cfg: Sett
     f.append(f"color=c={cfg.bar_color}:s={OUT_W}x{bh}:r={FPS}[bar]")
     
     # Ở đây thay vì lấy [graded] để ghép, ta lấy [with_ghost] là output của bước trên
-    f.append(f"[with_ghost][track]overlay=0:{y}:shortest=1[t1]")
+    if "visualizer" in fx_on:
+        f.append(efx.visualizer_overlay("with_ghost", "with_wave"))
+        f.append(f"[with_wave][track]overlay=0:{y}:shortest=1[t1]")
+    else:
+        f.append(f"[with_ghost][track]overlay=0:{y}:shortest=1[t1]")
     f.append(f"[t1][bar]overlay=x='-w+w*t/{out_dur:.3f}':y={y}:shortest=1[vout]")
 
     if bgm_input is not None:
@@ -577,7 +614,7 @@ def process_one(src: Path, dst: Path, cfg: Settings, seed: int) -> str:
         pool = sorted(p for p in cfg.broll_dir.iterdir()
                       if p.suffix.lower() in VIDEO_EXTS | IMAGE_EXTS)
         rng.shuffle(pool)
-        n_fx = len(plan_fx(segs, out_dur, cfg, random.Random(seed), 1))  
+        n_fx = len(plan_fx(segs, out_dur, cfg, random.Random(seed), 1))
         for clip in pool[:max(0, min(len(pool), n_fx))]:
             idx = cmd.count("-i")
             if clip.suffix.lower() in IMAGE_EXTS:
@@ -587,11 +624,41 @@ def process_one(src: Path, dst: Path, cfg: Settings, seed: int) -> str:
                 cmd += ["-t", f"{cfg.broll_len:.2f}", "-i", str(clip)]
             broll_inputs.append(idx)
 
+    # Random effects + color filters (original video stays the bottom layer)
+    title = video_title(src, cfg)
+    stickers = []
+    if cfg.stickers_dir:
+        stickers = sorted(p for p in cfg.stickers_dir.iterdir()
+                          if p.suffix.lower() in efx.STICKER_EXTS)
+    fx_on, filters = efx.choose(rng, cfg.n_effects, cfg.n_filters, cfg.effects, cfg.filters,
+                                bool(stickers), bool(title), info["has_audio"])
+    sticker_inputs = []
+    if "sticker" in fx_on and stickers:
+        for k in range(1 if out_dur < 15 else 2):
+            clip, d = rng.choice(stickers), 2.5
+            t = rng.uniform(cfg.hook_len / SPEED + 0.5, max(cfg.hook_len / SPEED + 1, out_dur - d - 0.5))
+            idx = cmd.count("-i")
+            ext = clip.suffix.lower()
+            if ext == ".gif":
+                cmd += ["-ignore_loop", "0", "-t", f"{d}", "-i", str(clip)]
+            elif ext == ".png":
+                cmd += ["-loop", "1", "-framerate", str(FPS), "-t", f"{d}", "-i", str(clip)]
+            else:
+                if ext == ".webm":
+                    cmd += ["-c:v", "libvpx-vp9"]  # keeps the alpha channel
+                cmd += ["-stream_loop", "-1", "-t", f"{d}", "-i", str(clip)]
+            sticker_inputs.append((idx, t, d))
+
+    text_ass = dst.with_suffix(".fx.ass")
+    has_text = efx.write_text_fx(text_ass, fx_on, title, cfg.cta, out_dur, cfg.font, rng)
+    plan = {"effects": fx_on, "filters": filters, "stickers": sticker_inputs,
+            "text_ass": text_ass if has_text else None}
+
     ass_file = dst.with_suffix(".subs.ass")
     has_subs = get_subtitles(src, segs, ass_file, cfg)
 
     graph = build_filter(segs, info["has_audio"], out_dur, cfg, rng, bgm_input, broll_inputs,
-                         ass_file if has_subs else None)
+                         ass_file if has_subs else None, plan)
     graph_file = dst.with_suffix(".filter.txt")
     graph_file.write_text(graph)
 
@@ -613,10 +680,26 @@ def process_one(src: Path, dst: Path, cfg: Settings, seed: int) -> str:
         if not cfg.keep_temp:
             graph_file.unlink(missing_ok=True)
             ass_file.unlink(missing_ok=True)
+            text_ass.unlink(missing_ok=True)
         tmp.unlink(missing_ok=True)
 
     return (f"{src.name}: {info['duration']:.1f}s -> {out_dur:.1f}s "
-            f"({len(segs)} segments) in {time.time() - t0:.0f}s")
+            f"({len(segs)} segments) in {time.time() - t0:.0f}s\n"
+            f"     effects: {', '.join(efx.EFFECTS[k] for k in fx_on)}\n"
+            f"     filters: {', '.join(efx.FILTERS[k][0] for k in filters)}")
+
+
+def video_title(src: Path, cfg: Settings) -> str:
+    """Title text for typewriter/highlight: video.txt (first line) > --title > file name."""
+    side = src.with_suffix(".txt")
+    if side.exists():
+        first = side.read_text(encoding="utf-8-sig").strip().splitlines()
+        if first and first[0].strip():
+            return first[0].strip()
+    if cfg.title:
+        return cfg.title
+    name = re.sub(r"[_\-.]+", " ", src.stem).strip()
+    return name if re.search(r"[^\W\d]{3,}", name) else ""
 
 
 def parse_range(s: str) -> tuple[float, float]:
@@ -677,6 +760,15 @@ def main() -> int:
     p.add_argument("--eq-low", type=float, default=90, help="high-pass Hz (cut bass, 0 = off)")
     p.add_argument("--eq-high", type=float, default=13000, help="low-pass Hz (cut treble, 0 = off)")
     p.add_argument("--reverb", type=float, default=0.04, help="reverb amount 0..0.05 (0 = off)")
+    p.add_argument("--n-effects", type=int, default=4, help="random effects per video")
+    p.add_argument("--n-filters", type=int, default=2, help="random color filters per video")
+    p.add_argument("--effects", default="", help="force effects, comma list: "
+                   + ",".join(efx.EFFECTS))
+    p.add_argument("--filters", default="", help="force color filters, comma list: "
+                   + ",".join(efx.FILTERS))
+    p.add_argument("-s", "--stickers", type=Path, help="folder of animated stickers (gif/png/mov/webm)")
+    p.add_argument("--title", help="title text for typewriter/highlight (default: video.txt or file name)")
+    p.add_argument("--cta", default="FOLLOW ĐỂ XEM THÊM", help="spring pop-up text at the end")
     a = p.parse_args()
 
     cfg = Settings(
@@ -693,7 +785,15 @@ def main() -> int:
         sub_upper=not a.no_upper, broll_dir=a.broll, fx_every=parse_range(a.fx_every),
         broll_len=a.broll_len, eq_low=a.eq_low, eq_high=a.eq_high,
         reverb=min(max(a.reverb, 0.0), 0.05),
+        n_effects=a.n_effects, n_filters=a.n_filters,
+        effects=[x.strip() for x in a.effects.split(",") if x.strip()],
+        filters=[x.strip() for x in a.filters.split(",") if x.strip()],
+        stickers_dir=a.stickers, title=a.title, cta=a.cta,
     )
+    bad = [x for x in cfg.effects if x not in efx.EFFECTS] + \
+          [x for x in cfg.filters if x not in efx.FILTERS]
+    if bad:
+        p.error(f"unknown effect/filter: {', '.join(bad)}")
     if cfg.music_dir and not cfg.music_dir.is_dir():
         p.error(f"music folder not found: {cfg.music_dir}")
     if cfg.broll_dir and not cfg.broll_dir.is_dir():

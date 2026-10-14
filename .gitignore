@@ -2,6 +2,8 @@ input/
 output/
 music/
 broll/
+stickers/
+*.fx.ass
 *.subs.ass
 __pycache__/
 *.part.mp4

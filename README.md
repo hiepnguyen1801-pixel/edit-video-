@@ -77,4 +77,42 @@ Phụ đề:
 
 Thư mục `broll/` chứa ảnh (jpg/png) hoặc clip ngắn, mỗi lần chèn dài 0.5 giây.
 
+## Hiệu ứng và bộ lọc ngẫu nhiên
+
+Video gốc luôn là **lớp dưới cùng**. Mỗi video tự bốc ngẫu nhiên **4 hiệu ứng** và **2 bộ lọc màu** để phủ lên trên. Kết quả bốc được in ra sau mỗi video.
+
+| Mã | Hiệu ứng | Cách làm |
+|---|---|---|
+| `typewriter` | Gõ chữ | Tiêu đề hiện từng ký tự kèm con trỏ, 4 giây đầu |
+| `kenburns` | Ken Burns | Zoom chậm 104%→~112% (hoặc ngược lại) và trượt khung suốt video, thay cho zoom 102-105% |
+| `visualizer` | Sóng âm | Dạng sóng của giọng nói ở đáy safe box (bỏ qua với video không có tiếng) |
+| `spring` | Nảy bật | Hộp CTA (`--cta`) bật ra kiểu lò xo ở 3 giây cuối |
+| `highlight` | Quét dạ quang | Vệt bút dạ vàng quét qua tiêu đề ở giữa video |
+| `glitch` | Nhiễu RGB | Tách màu RGB + nhiễu 0.2s ở điểm chuyển hook→thân và một số điểm cắt |
+| `lightleak` | Light Leaks / Film Burn | Vệt sáng cam/đỏ lóe lên rồi tắt, 1-4 lần |
+| `sticker` | Sticker động | Sticker trong thư mục `-s stickers/` hiện 2.5s ở góc safe box |
+
+Thanh tiến trình là yêu cầu bắt buộc nên luôn được bật, không nằm trong phần bốc ngẫu nhiên.
+
+| Mã | Bộ lọc | CSS gốc |
+|---|---|---|
+| `nga-lanh` | Ngà lạnh | `brightness(1.1) saturate(0.8) contrast(1.05) hue-rotate(5deg)` |
+| `sac-net-4k` | Sắc nét 4K | `contrast(1.2) saturate(1.15) brightness(1.05)` |
+| `dien-anh` | Phim điện ảnh | `contrast(1.15) saturate(0.9) brightness(0.9) sepia(0.2)` |
+| `trang-den` | Trắng đen | `grayscale(1) contrast(1.3) brightness(0.9)` |
+| `sang-am` | Sáng ấm | `sepia(0.3) saturate(1.2) brightness(1.05) contrast(1.05)` |
+
+Các chuỗi CSS được quy đổi chính xác theo công thức ma trận của chuẩn CSS rồi chạy bằng ffmpeg. 2 bộ lọc được áp chồng lên nhau theo thứ tự bốc.
+
+```bash
+python3 tiktok_batch.py -i input -o output -m music -s stickers --title "Review món đồ siêu hay"
+# Chọn cố định thay vì ngẫu nhiên:
+python3 tiktok_batch.py -i input -o output --effects typewriter,glitch,kenburns,spring --filters dien-anh,sang-am
+# Đổi số lượng:
+python3 tiktok_batch.py -i input -o output --n-effects 3 --n-filters 1
+```
+
+- **Tiêu đề** (cho Gõ chữ và Quét dạ quang): lấy dòng đầu của file `.txt` trùng tên video (`abc.mp4` + `abc.txt`). Nếu không có thì lấy `--title`, rồi đến tên file. Nếu không có tiêu đề nào, 3 hiệu ứng chữ sẽ không được bốc.
+- **Sticker**: hỗ trợ GIF, PNG, MOV/WEBM có nền trong suốt. File Lottie `.json` cần xuất sang GIF hoặc WEBM trước (ví dụ trên LottieFiles). Không có thư mục sticker thì hiệu ứng này không được bốc.
+
 Chỉ dùng cho video và nhạc mà bạn có quyền sử dụng.
